@@ -1,4 +1,4 @@
-# FIX FOR PYTHON 3.13 - audioop removed
+# FIX FOR PYTHON 3.13
 try:
     import audioop
 except ModuleNotFoundError:
@@ -8,8 +8,7 @@ except ModuleNotFoundError:
 
 import os
 import discord
-from discord import app_commands
-from discord.ext import tasks
+from discord.ext import commands, tasks
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from flask import Flask
@@ -20,7 +19,6 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-GUILD_ID = int(os.getenv("GUILD_ID", "0")) if os.getenv("GUILD_ID") else None
 
 # --- DATABASE ---
 conn = sqlite3.connect("subs.db", check_same_thread=False)
@@ -31,7 +29,7 @@ cur.execute("""CREATE TABLE IF NOT EXISTS subs (
     guild_id INTEGER,
     start_date TEXT,
     end_date TEXT,
-    total_days INTEGER DEFAULT 0,
+    total_seconds INTEGER DEFAULT 0,
     PRIMARY KEY(user_id, guild_id)
 )""")
 conn.commit()
@@ -39,162 +37,162 @@ conn.commit()
 # --- FLASK FOR RENDER ---
 flask_app = Flask(__name__)
 @flask_app.route('/')
-def home(): return "Subscription Bot is Online ✅"
+def home(): return "Bot Running - $ prefix"
 @flask_app.route('/ping')
 def ping(): return "OK"
 def run_flask():
     flask_app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
-# --- DISCORD BOT ---
+# --- BOT WITH $ PREFIX ---
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-bot = discord.Client(intents=intents)
-tree = app_commands.CommandTree(bot)
+bot = commands.Bot(command_prefix="$", intents=intents, help_command=None)
 
-def is_owner(interaction: discord.Interaction):
-    return interaction.user.id == OWNER_ID
+def owner_only():
+    async def predicate(ctx):
+        return ctx.author.id == OWNER_ID
+    return commands.check(predicate)
 
-async def send_dm(user, role_name, start, end, days_left):
+async def send_dm(user, role_name, start, end, duration_text):
     try:
         embed = discord.Embed(title="✅ Subscription Activated!", color=0x00ff99)
         embed.add_field(name="Role Given", value=f"**{role_name}**", inline=False)
-        embed.add_field(name="Start", value=start.strftime("%d %b %Y %I:%M %p UTC"), inline=True)
-        embed.add_field(name="End", value=end.strftime("%d %b %Y %I:%M %p UTC"), inline=True)
-        embed.add_field(name="Duration", value=f"**{days_left} Days**", inline=False)
+        embed.add_field(name="Start", value=start.strftime("%d %b %Y %I:%M:%S %p UTC"), inline=True)
+        embed.add_field(name="End", value=end.strftime("%d %b %Y %I:%M:%S %p UTC"), inline=True)
+        embed.add_field(name="Duration", value=f"**{duration_text}**", inline=False)
         embed.set_footer(text="Role will be removed automatically after expiry.")
         await user.send(embed=embed)
         return True
-    except Exception as e:
-        print(f"DM failed for {user}: {e}")
+    except:
         return False
 
-async def add_subscription(guild, member, days):
+async def add_subscription(guild, member, seconds: int, label: str):
     cur.execute("SELECT role_id FROM config WHERE guild_id=?", (guild.id,))
     row = cur.fetchone()
-    if not row: return False, "Use /config first to set role."
+    if not row: return False, "Use `$config @role` first."
     role = guild.get_role(row[0])
-    if not role: return False, "Configured role not found. Set again."
+    if not role: return False, "Configured role not found."
+
+    if role >= guild.me.top_role:
+        return False, "My role is below subscription role. Move my bot role higher!"
 
     now = datetime.now(timezone.utc)
-    end = now + timedelta(days=days)
+    end = now + timedelta(seconds=seconds)
 
-    cur.execute("SELECT end_date, total_days FROM subs WHERE user_id=? AND guild_id=?", (member.id, guild.id))
+    # Continuity check
+    cur.execute("SELECT end_date, total_seconds FROM subs WHERE user_id=? AND guild_id=?", (member.id, guild.id))
     existing = cur.fetchone()
-    total_days = days
+    total = seconds
     if existing:
         prev_end = datetime.fromisoformat(existing[0])
-        if now <= prev_end + timedelta(days=2): # continuous streak
-            total_days = existing[1] + days
+        if now <= prev_end + timedelta(days=2):
+            total = existing[1] + seconds
 
     cur.execute("INSERT OR REPLACE INTO subs VALUES (?,?,?,?,?)",
-                (member.id, guild.id, now.isoformat(), end.isoformat(), total_days))
+                (member.id, guild.id, now.isoformat(), end.isoformat(), total))
     conn.commit()
-    try:
-        await member.add_roles(role, reason=f"Sub {days}d")
-    except Exception as e:
-        return False, f"Failed to add role: {e} - Move bot role higher!"
 
-    await send_dm(member, role.name, now, end, days)
-    return True, total_days
+    try:
+        await member.add_roles(role, reason=f"Sub {label}")
+    except Exception as e:
+        return False, f"Failed to add role: {e}"
+
+    await send_dm(member, role.name, now, end, label)
+    return True, total
 
 # --- COMMANDS ---
 
-@tree.command(name="sync", description="Sync commands (Owner only)")
-async def sync_cmd(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("❌ Only owner can use this.", ephemeral=True)
-    await interaction.response.defer(ephemeral=True)
-    try:
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            tree.copy_global_to(guild=guild)
-            synced = await tree.sync(guild=guild)
-            await interaction.followup.send(f"✅ Synced {len(synced)} commands to guild {GUILD_ID} (Instant)", ephemeral=True)
-        else:
-            synced = await tree.sync()
-            await interaction.followup.send(f"✅ Synced {len(synced)} commands globally. Global takes 1 hour to update.", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Sync failed: {e}", ephemeral=True)
-
-@tree.command(name="config", description="Set the subscription role")
-@app_commands.describe(role="Role to give")
-async def config_cmd(interaction: discord.Interaction, role: discord.Role):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("❌ Only owner.", ephemeral=True)
-    if role >= interaction.guild.me.top_role:
-        return await interaction.response.send_message("❌ My role is below that role. Move my role higher in Server Settings > Roles.", ephemeral=True)
-    cur.execute("INSERT OR REPLACE INTO config VALUES (?,?)", (interaction.guild.id, role.id))
+@bot.command(name="config")
+@owner_only()
+async def config_cmd(ctx, role: discord.Role):
+    cur.execute("INSERT OR REPLACE INTO config VALUES (?,?)", (ctx.guild.id, role.id))
     conn.commit()
-    await interaction.response.send_message(f"✅ Subscription role set to {role.mention}", ephemeral=True)
+    await ctx.send(f"✅ Subscription role set to {role.mention}")
 
-@tree.command(name="sub_1", description="Give 7 days subscription")
-@app_commands.describe(user="User to subscribe")
-async def sub1(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("❌ Only owner.", ephemeral=True)
-    await interaction.response.defer(ephemeral=True)
-    ok, res = await add_subscription(interaction.guild, user, 7)
-    if ok: await interaction.followup.send(f"✅ {user.mention} got 7 days. Streak: {res} days", ephemeral=True)
-    else: await interaction.followup.send(f"❌ {res}", ephemeral=True)
+@bot.command(name="sub_1")
+@owner_only()
+async def sub1_cmd(ctx, member: discord.Member):
+    # 7 days in seconds
+    seconds = 7 * 24 * 3600
+    ok, res = await add_subscription(ctx.guild, member, seconds, "7 Days")
+    if ok: await ctx.send(f"✅ {member.mention} subscribed for 7 days. Total: {res//3600} hours")
+    else: await ctx.send(f"❌ {res}")
 
-@tree.command(name="sub_2", description="Give 30 days subscription")
-@app_commands.describe(user="User to subscribe")
-async def sub2(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("❌ Only owner.", ephemeral=True)
-    await interaction.response.defer(ephemeral=True)
-    ok, res = await add_subscription(interaction.guild, user, 30)
-    if ok: await interaction.followup.send(f"✅ {user.mention} got 30 days. Streak: {res} days", ephemeral=True)
-    else: await interaction.followup.send(f"❌ {res}", ephemeral=True)
+@bot.command(name="sub_2")
+@owner_only()
+async def sub2_cmd(ctx, member: discord.Member):
+    # 30 days in seconds
+    seconds = 30 * 24 * 3600
+    ok, res = await add_subscription(ctx.guild, member, seconds, "30 Days")
+    if ok: await ctx.send(f"✅ {member.mention} subscribed for 30 days. Total: {res//3600} hours")
+    else: await ctx.send(f"❌ {res}")
 
-@tree.command(name="set_sub", description="Give custom days subscription")
-@app_commands.describe(user="User", days="Days 1-365")
-async def set_sub(interaction: discord.Interaction, user: discord.Member, days: int):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("❌ Only owner.", ephemeral=True)
-    if not 1 <= days <= 365:
-        return await interaction.response.send_message("❌ Days must be 1-365", ephemeral=True)
-    await interaction.response.defer(ephemeral=True)
-    ok, res = await add_subscription(interaction.guild, user, days)
-    if ok: await interaction.followup.send(f"✅ {user.mention} got {days} days. Streak: {res} days", ephemeral=True)
-    else: await interaction.followup.send(f"❌ {res}", ephemeral=True)
+@bot.command(name="set_sub")
+@owner_only()
+async def set_sub_cmd(ctx, member: discord.Member, seconds: int):
+    """ $set_sub @user 60 -> 60 seconds """
+    if seconds <= 0 or seconds > 31536000: # max 1 year
+        return await ctx.send("❌ Seconds must be 1 to 31536000 (1 year)")
+    ok, res = await add_subscription(ctx.guild, member, seconds, f"{seconds} Seconds")
+    if ok:
+        await ctx.send(f"✅ {member.mention} subscribed for **{seconds} seconds**. Ends <t:{int((datetime.now(timezone.utc)+timedelta(seconds=seconds)).timestamp())}:R>")
+    else:
+        await ctx.send(f"❌ {res}")
 
-@tree.command(name="leaderboard", description="Show subscription leaderboard")
-async def leaderboard(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("❌ Only owner.", ephemeral=True)
-    cur.execute("SELECT user_id, total_days, end_date FROM subs WHERE guild_id=? ORDER BY total_days DESC LIMIT 10", (interaction.guild.id,))
+@bot.command(name="leaderboard")
+@owner_only()
+async def leaderboard_cmd(ctx):
+    cur.execute("SELECT user_id, total_seconds, end_date FROM subs WHERE guild_id=? ORDER BY total_seconds DESC LIMIT 10", (ctx.guild.id,))
     rows = cur.fetchall()
-    if not rows: return await interaction.response.send_message("No subs yet.", ephemeral=True)
+    if not rows: return await ctx.send("No subscribers yet.")
     embed = discord.Embed(title="🏆 Subscription Leaderboard", color=0xffd700)
     desc=""
-    for i,(uid,total,end_iso) in enumerate(rows,1):
+    for i,(uid,total_sec,end_iso) in enumerate(rows,1):
         end=datetime.fromisoformat(end_iso)
-        left=max(0,(end-datetime.now(timezone.utc)).days)
-        status=f"🟢 {left}d left" if left>0 else "🔴 Expired"
-        desc+=f"**{i}.** <@{uid}> — **{total}d** total | {status}\n"
+        left = (end - datetime.now(timezone.utc)).total_seconds()
+        left = max(0,int(left))
+        status = f"🟢 {left}s left" if left>0 else "🔴 Expired"
+        # Show continuous time nicely
+        if total_sec >= 86400:
+            total_str = f"{total_sec//86400}d {total_sec%86400//3600}h"
+        elif total_sec >= 3600:
+            total_str = f"{total_sec//3600}h"
+        else:
+            total_str = f"{total_sec}s"
+        desc+=f"**{i}.** <@{uid}> — **{total_str}** total | {status}\n"
     embed.description=desc
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await ctx.send(embed=embed)
+
+@bot.command(name="sync")
+@owner_only()
+async def sync_cmd(ctx):
+    # For $ prefix, sync is not needed, but this will sync any old slash commands and clear them
+    try:
+        # Clear old slash commands if any
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
+        await ctx.send("✅ Cleared old slash commands. Now using $ prefix only.")
+    except Exception as e:
+        await ctx.send(f"Sync error: {e}")
+
+@bot.command(name="help")
+@owner_only()
+async def help_cmd(ctx):
+    embed=discord.Embed(title="Subscription Bot - $ Commands", color=0x00ff99)
+    embed.add_field(name="$config @role", value="Set subscription role", inline=False)
+    embed.add_field(name="$sub_1 @user", value="Give 7 days sub", inline=False)
+    embed.add_field(name="$sub_2 @user", value="Give 30 days sub", inline=False)
+    embed.add_field(name="$set_sub @user <seconds>", value="Ex: `$set_sub @user 60` = 60 seconds", inline=False)
+    embed.add_field(name="$leaderboard", value="Show leaderboard", inline=False)
+    await ctx.send(embed=embed)
 
 @bot.event
 async def on_ready():
-    print(f"Logged in {bot.user}")
-    # Auto sync on startup
-    try:
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            tree.copy_global_to(guild=guild)
-            await tree.sync(guild=guild)
-            print(f"Synced to guild {GUILD_ID}")
-        else:
-            await tree.sync()
-            print("Synced globally")
-    except Exception as e:
-        print(f"Sync error: {e}")
+    print(f"Logged in as {bot.user} | Prefix: $")
     check_expiry.start()
 
-@tasks.loop(minutes=1)
+@tasks.loop(seconds=10) # Check every 10 sec because you use seconds
 async def check_expiry():
     now=datetime.now(timezone.utc)
     cur.execute("SELECT user_id, guild_id, end_date FROM subs")
@@ -213,7 +211,18 @@ async def check_expiry():
                     await member.remove_roles(role, reason="Sub expired")
                     try: await member.send(f"❌ Your **{role.name}** expired in **{guild.name}**.")
                     except: pass
-                except Exception as e: print(e)
+                    print(f"Removed role from {uid}")
+                except Exception as e:
+                    print(e)
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("❌ Only owner can use this bot.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Missing args. Use `$help`")
+    else:
+        print(error)
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
